@@ -98,6 +98,66 @@ def get_credentials():
     return creds
 
 
+def normalize_markdown_for_diff(text: str) -> str:
+    """Normalize markdown for clean diffing between local and Google Docs.
+
+    Google Docs exports markdown with various formatting differences that
+    aren't meaningful for content comparison. This function normalizes both
+    sides to show only actual content changes.
+    """
+    import subprocess
+    import tempfile
+
+    # Strip YAML frontmatter
+    text = re.sub(r'^---\n.*?\n---\n', '', text, flags=re.DOTALL)
+    # Strip HTML comments
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.DOTALL)
+
+    # Try to run prettier for consistent formatting
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.md', delete=False) as f:
+            f.write(text)
+            temp_path = f.name
+
+        result = subprocess.run(
+            ['npx', 'prettier', '--prose-wrap', 'always', '--print-width', '9999', temp_path],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            text = result.stdout
+
+        os.unlink(temp_path)
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        pass  # prettier not available, continue without it
+
+    # Unescape characters that Google Docs escapes
+    text = text.replace('\\>', '>')
+    text = text.replace('\\<', '<')
+    text = text.replace('\\+', '+')
+    text = text.replace('\\!', '!')
+    text = text.replace('\\_', '_')
+    text = text.replace('\\~', '~')
+    text = text.replace('\\*', '*')
+    text = text.replace('\\-', '-')
+
+    # Strip mailto link wrappers: [email](mailto:email) -> email
+    text = re.sub(r'\[([^\]]+)\]\(mailto:\1\)', r'\1', text)
+
+    # Normalize table alignment markers (strip colons)
+    text = re.sub(r':?-{3,}:?', '---', text)
+
+    # Strip trailing whitespace from lines
+    text = '\n'.join(line.rstrip() for line in text.split('\n'))
+
+    # Collapse multiple blank lines to one
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    # Strip leading/trailing whitespace
+    text = text.strip()
+
+    return text
+
+
 def extract_doc_id(url_or_id: str) -> str:
     """Extract document ID from a Google Docs URL or return the ID if already provided."""
     # If it's already just an ID (no slashes or dots), return it
@@ -1736,7 +1796,7 @@ def show_diff(content1: str, content2: str, label1: str, label2: str):
         print("No differences found - files are identical")
 
 
-def diff_markdown_to_gdoc(markdown_path: str, doc_id: str, creds):
+def diff_markdown_to_gdoc(markdown_path: str, doc_id: str, creds, normalize: bool = False):
     """Show diff between markdown file and Google Doc (dry run)."""
     try:
         # Check if Google Doc is frozen
@@ -1744,25 +1804,30 @@ def diff_markdown_to_gdoc(markdown_path: str, doc_id: str, creds):
             print(f"⚠️  Google Doc is frozen (locked) - diff not available")
             print(f"Use --unlock to enable syncing to this document")
             return
-        
+
         # Read markdown file
         with open(markdown_path, 'r', encoding='utf-8') as f:
             markdown_content = f.read()
-        
+
         # Strip frontmatter for comparison (same as what would be synced)
         markdown_for_gdoc = strip_frontmatter_for_remote_sync(markdown_content)
-        
+
         # Export Google Doc to markdown for comparison
         gdoc_markdown = export_gdoc_to_markdown(doc_id, creds)
-        
+
+        # Normalize if requested
+        if normalize:
+            markdown_for_gdoc = normalize_markdown_for_diff(markdown_for_gdoc)
+            gdoc_markdown = normalize_markdown_for_diff(gdoc_markdown)
+
         # Show diff
         show_diff(
-            gdoc_markdown, 
+            gdoc_markdown,
             markdown_for_gdoc,
             f"Google Doc {doc_id}",
             f"Local file {markdown_path}"
         )
-        
+
     except FileNotFoundError:
         print(f"Error: Markdown file not found: {markdown_path}", file=sys.stderr)
         sys.exit(1)
@@ -1771,16 +1836,21 @@ def diff_markdown_to_gdoc(markdown_path: str, doc_id: str, creds):
         sys.exit(1)
 
 
-def diff_gdoc_to_markdown(doc_id: str, markdown_path: str, creds):
+def diff_gdoc_to_markdown(doc_id: str, markdown_path: str, creds, normalize: bool = False):
     """Show diff between Google Doc and markdown file (dry run)."""
     try:
         # Export Google Doc to markdown
         gdoc_markdown = export_gdoc_to_markdown(doc_id, creds)
-        
+
         # Read local markdown file
         with open(markdown_path, 'r', encoding='utf-8') as f:
             local_markdown = f.read()
-        
+
+        # Normalize if requested
+        if normalize:
+            local_markdown = normalize_markdown_for_diff(local_markdown)
+            gdoc_markdown = normalize_markdown_for_diff(gdoc_markdown)
+
         # Show diff
         show_diff(
             local_markdown,
@@ -1788,7 +1858,7 @@ def diff_gdoc_to_markdown(doc_id: str, markdown_path: str, creds):
             f"Local file {markdown_path}",
             f"Google Doc {doc_id}"
         )
-        
+
     except FileNotFoundError:
         print(f"Error: Markdown file not found: {markdown_path}", file=sys.stderr)
         sys.exit(1)
@@ -3821,6 +3891,8 @@ def main():
                        help='Skip confirmation when overwriting existing Google Doc links in frontmatter')
     parser.add_argument('--diff', action='store_true',
                        help='Show diff between source and destination (markdown as common format)')
+    parser.add_argument('--normalize', action='store_true',
+                       help='Normalize markdown before diffing (uses prettier, strips Google Docs escapes)')
     parser.add_argument('--format', type=str, choices=['text', 'json', 'markdown'],
                        default='text', metavar='FORMAT',
                        help='Output format: text, json, or markdown (default: text)')
@@ -4053,11 +4125,11 @@ def main():
         if source_is_markdown and dest_is_gdoc:
             # Markdown → Google Doc diff
             doc_id = extract_doc_id(args.destination)
-            diff_markdown_to_gdoc(args.source, doc_id, creds)
+            diff_markdown_to_gdoc(args.source, doc_id, creds, normalize=args.normalize)
         elif source_is_gdoc and dest_is_markdown:
             # Google Doc → Markdown diff
             doc_id = extract_doc_id(args.source)
-            diff_gdoc_to_markdown(doc_id, args.destination, creds)
+            diff_gdoc_to_markdown(doc_id, args.destination, creds, normalize=args.normalize)
         elif source_is_markdown and dest_is_confluence:
             # Markdown → Confluence diff
             diff_markdown_to_confluence(args.source, args.destination, confluence)
