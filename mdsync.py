@@ -98,6 +98,73 @@ def get_credentials():
     return creds
 
 
+def check_upstream_changes(markdown_path: str, doc_id: str, creds, force: bool = False) -> bool:
+    """Check if Google Doc has changes that would be overwritten.
+
+    Returns True if safe to proceed, False if user cancelled.
+    """
+    try:
+        # Read local markdown
+        with open(markdown_path, 'r', encoding='utf-8') as f:
+            local_content = f.read()
+        local_content = strip_frontmatter_for_remote_sync(local_content)
+
+        # Export Google Doc
+        gdoc_content = export_gdoc_to_markdown(doc_id, creds)
+
+        # Normalize both for comparison
+        local_normalized = normalize_markdown_for_diff(local_content)
+        gdoc_normalized = normalize_markdown_for_diff(gdoc_content)
+
+        if local_normalized == gdoc_normalized:
+            return True  # No changes, safe to proceed
+
+        # There are differences - compute the diff
+        import difflib
+        diff_lines = list(difflib.unified_diff(
+            local_normalized.splitlines(keepends=True),
+            gdoc_normalized.splitlines(keepends=True),
+            fromfile='local',
+            tofile='Google Doc',
+            lineterm=''
+        ))
+
+        # Count actual content changes (not just headers)
+        change_count = sum(1 for line in diff_lines if line.startswith(('+', '-')) and not line.startswith(('+++', '---')))
+
+        if change_count == 0:
+            return True  # No meaningful changes
+
+        if force:
+            return True  # User requested to skip confirmation
+
+        print("\n⚠️  Google Doc has changes that would be overwritten:")
+        print(''.join(diff_lines[:50]))  # Show first 50 lines of diff
+        if len(diff_lines) > 50:
+            print(f"... ({len(diff_lines) - 50} more lines)")
+        print()
+
+        # Only prompt if stdin is a tty, otherwise fail
+        if not sys.stdin.isatty():
+            print("Use --force to overwrite.", file=sys.stderr)
+            return False
+
+        try:
+            response = input("Proceed and overwrite these changes? [y/N]: ").strip().lower()
+            if response in ['y', 'yes']:
+                return True
+            print("Sync cancelled.")
+            return False
+        except (KeyboardInterrupt, EOFError):
+            print("\nSync cancelled.")
+            return False
+
+    except Exception as e:
+        # Fail if we can't check - don't proceed unsafely
+        print(f"Error: Could not check for upstream changes: {e}", file=sys.stderr)
+        return False
+
+
 def normalize_markdown_for_diff(text: str) -> str:
     """Normalize markdown for clean diffing between local and Google Docs.
 
@@ -4542,10 +4609,15 @@ def main():
                             print()
             except Exception:
                 pass  # Not a batch file, continue with normal processing
-            
+
+            # Check for upstream changes that would be overwritten
+            if not args.url_only:
+                if not check_upstream_changes(args.source, doc_id, creds, force=args.force):
+                    sys.exit(0)
+
             if not args.url_only:
                 print(f"Importing {args.source} to Google Doc {doc_id}...")
-            
+
             import_markdown_to_gdoc(args.source, doc_id, creds, quiet=args.url_only)
             if args.url_only:
                 print(f"https://docs.google.com/document/d/{doc_id}/edit")
