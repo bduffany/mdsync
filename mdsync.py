@@ -206,6 +206,8 @@ def normalize_markdown_for_diff(text: str) -> str:
     text = text.replace('\\~', '~')
     text = text.replace('\\*', '*')
     text = text.replace('\\-', '-')
+    text = text.replace('\\[', '[')
+    text = text.replace('\\]', ']')
 
     # Strip mailto link wrappers: [email](mailto:email) -> email
     text = re.sub(r'\[([^\]]+)\]\(mailto:\1\)', r'\1', text)
